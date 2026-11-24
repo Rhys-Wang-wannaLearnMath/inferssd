@@ -1972,7 +1972,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         const auto prefetch = [&]() { res->prefetch_inputs(&ubatch); };
         bool allocated = false;
         if (cpu_sink_runtime) {
-            allocated = reserve_compute_graph(gf, prompt_pass, prefetch) &&
+            allocated = reserve_compute_graph(gf, prompt_pass, prefetch,
+                    prompt_pass && cpu_prefill_reserve_pending ? ubatch.n_tokens : 0) &&
                 ggml_backend_sched_alloc_prepared(sched.get(), gf);
         } else {
             prefetch();
@@ -3122,7 +3123,8 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
     return static_cast<llm_graph_result *>(gf_res_reserve.get());
 }
 
-bool llama_context::reserve_compute_graph(ggml_cgraph * graph, bool prefill, const std::function<void()> & admitted) {
+bool llama_context::reserve_compute_graph(ggml_cgraph * graph, bool prefill, const std::function<void()> & admitted,
+        uint32_t pass_tokens) {
     if (!cpu_sink_runtime) {
         if (admitted) { admitted(); }
         return ggml_backend_sched_reserve(sched.get(), graph);
@@ -3139,6 +3141,12 @@ bool llama_context::reserve_compute_graph(ggml_cgraph * graph, bool prefill, con
     }
     std::vector<size_t> required(backend_ptrs.size(), 0);
     if (!ggml_backend_sched_prepare_graph(sched.get(), graph, required.data())) { return false; }
+    // Hold mandatory executor memory before the graph takes its room (upstream #364).
+    // Refusal leaves the existing prefill_refit path to select a smaller ubatch.
+    if (prefill && pass_tokens > 1 && !cpu_sink_runtime->reserve_pass(pass_tokens)) {
+        ggml_backend_sched_reset(sched.get());
+        return false;
+    }
     uint64_t host_bytes = 0, device_bytes = 0;
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
         // Query AFTER the probe: it can have released chunks even when the
@@ -3229,7 +3237,8 @@ ggml_cgraph * llama_context::graph_reserve(
         } else {
             ggml_backend_sched_split_graph(sched.get(), gf);
         }
-    } else if (!reserve_compute_graph(gf, n_tokens > n_seqs && !cpu_sink_decode_active)) {
+    } else if (!reserve_compute_graph(gf, n_tokens > n_seqs && !cpu_sink_decode_active, {},
+            cpu_prefill_reserve_pending && !cpu_sink_decode_active ? n_tokens : 0)) {
         GGML_ASSERT(!sizes);
         LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
         return nullptr;
